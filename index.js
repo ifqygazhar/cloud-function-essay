@@ -1,185 +1,177 @@
-require('dotenv').config();
+// functions/index.js
+
 const functions = require('firebase-functions');
-const { ChatOpenAI } = require("@langchain/openai");
-const helmet = require('helmet');
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const { v4: uuidv4 } = require('uuid');
+const { ChatOpenAI } = require("@langchain/openai");
+const { PromptTemplate } = require("@langchain/core/prompts");
 
+
+// Initialize Express app
 const app = express();
+
+// Apply middleware
 app.use(helmet());
-const port = 8000;
-
-const llm = new ChatOpenAI({
-  model: "gpt-4",
-  temperature: 0.5,
-  maxTokens: undefined,
-  timeout: undefined,
-  maxRetries: 2,
-  apiKey: "apikey",
-});
-
-// Mengizinkan CORS untuk semua origin
 app.use(cors());
-
-// Middleware untuk meng-handle request body dalam format JSON
 app.use(express.json());
 
-// Data untuk menyimpan hasil analisis berdasarkan requestId
+const openaiApiKey = "API-KEY";  // Add your actual key here
+
+// Initialize ChatOpenAI with LangChain
+const model = new ChatOpenAI({
+  openAIApiKey: openaiApiKey,
+  modelName: "o1-mini",
+  temperature: 1,
+});
+
+// In-memory storage for results (optional if using Firestore)
 let results = {};
 
-// Dummy data structure sebagai template
-const dummyDataStructure = {
-  "mistakes": []
-};
+// Helper function to escape curly braces
+function escapeBraces(str) {
+  return str.replace(/{/g, '{{').replace(/}/g, '}}');
+}
 
-app.get('/result/:requestId', (req, res) => {
-  const { requestId } = req.params;
-  if (results[requestId]) {
-    res.json(results[requestId]);
-  } else {
-    res.status(404).json({ error: "Result not found." });
+function validateJSON(jsonString) {
+  try {
+    // Remove unwanted characters such as markdown or extra non-JSON text
+    const cleanedJsonString = jsonString
+      .replace(/```(?:json)?/g, '')  // Remove ```json or ``` markers
+      .replace(/\n/g, '')             // Remove newlines
+      .replace(/\s+/g, ' ')           // Replace multiple spaces with single space
+      .trim();                        // Remove leading and trailing spaces
+
+
+    const parsed = JSON.parse(cleanedJsonString);
+    return parsed;
+  } catch (error) {
+    console.error("Invalid JSON response:", error);
+    throw new Error("Failed to parse JSON response from the model.");
+  }
+}
+
+// Function to evaluate the essay
+async function evaluateEssay(text) {
+  const evaluationJsonTemplate = `
+  {{
+    "grade": "",
+    "mistakes": [
+        {{
+          "mistake": "",
+          "location": "",
+          "correction": "",
+          "explanation": "",
+          "error_type": "",
+          "rule": ""
+        }}
+      ]
+  }}`;
+
+  const promptTemplate = new PromptTemplate({
+    template: `Evaluate the following essay {text}, providing a grade from 1 to 5 like 2/5 and highlighting all grammar and orthographic mistakes.
+
+For each mistake, return the mistake, the full sentence (location) where the mistake occurs, and the correction.
+Also provide an explanation for why it's wrong, the type of error (e.g., Subject-Verb Agreement, Tense, etc.), and the grammar rule that applies.
+Strictly return valid JSON. No other text should be included in the response.
+Essay:
+{text}
+
+Your response must follow this JSON structure:
+${evaluationJsonTemplate}`,
+    inputVariables: ["text"],
+  });
+
+  const formattedPrompt = await promptTemplate.format({ text });
+  const messages = [{ role: "user", content: formattedPrompt }];
+  const rawResult = await model.call(messages);
+
+  const evaluation = validateJSON(rawResult.content);
+  return evaluation;
+}
+
+// Function to analyze the semantic parts of the essay
+async function analyzeSemanticParts(text, evaluation) {
+  const analyzeSemanticPartsJson = `
+  {{
+    "data": [
+      {{
+        "part": "",
+        "feedback": {{
+          "positive": "",
+          "improvement_suggestions": ""
+        }}
+      }}
+    ],
+    "overall_analysis": "",
+    "improved_text": ""
+  }}`;
+
+  const escapedEvaluation = escapeBraces(JSON.stringify(evaluation, null, 2));
+
+  const promptTemplate = new PromptTemplate({
+    template: `Perform an in-depth analysis of the following essay {text}:
+Essay:
+{text}
+
+1. Split the essay into 4-8 distinct semantic parts.
+2. For each part, provide detailed feedback on:
+   - What the user got right (structure, content, and argumentation).
+   - What the user got wrong or could improve.
+   - Provide specific suggestions on how to improve each part.
+3. Include a light grammar and orthographic review based on this previous evaluation:
+${escapedEvaluation}
+4. Provide an overall analysis of the entire essay, summarizing strengths and weaknesses.
+5. Generate an improved version of the essay.
+
+Strictly return valid JSON in the following structure:
+${analyzeSemanticPartsJson}`,
+    inputVariables: ["text"],
+  });
+
+  const formattedPrompt = await promptTemplate.format({ text });
+  const messages = [{ role: "user", content: formattedPrompt }];
+  const rawResult = await model.call(messages);
+
+  const semanticAnalysis = validateJSON(rawResult.content);
+  return semanticAnalysis;
+}
+
+// Define the /analyze endpoint
+app.post('/analyze', async (req, res) => {
+  const { text } = req.body;
+  
+  if (!text) {
+    return res.status(400).json({ error: 'Essay text is required' });
+  }
+
+  try {
+    // Evaluate the essay first
+    const evaluation = await evaluateEssay(text);
+    
+    // Perform semantic analysis using the evaluation result
+    const semanticAnalysis = await analyzeSemanticParts(text, evaluation);
+
+    // Store the result (optional if using Firestore or another database)
+    results = {
+      evaluation,
+      semanticAnalysis,
+      createdAt: new Date().toISOString(),
+    };
+
+    // Return the combined result to the user
+    res.json({
+      evaluation,
+      semanticAnalysis
+    });
+  } catch (error) {
+    console.error('Error processing essay:', error);
+    res.status(500).json({ error: 'Failed to analyze the essay.' });
   }
 });
 
-app.post('/analyze', async (req, res) => {
-    const { text } = req.body;
-    if (!text) {
-      return res.status(400).json({ error: "No text provided." });
-    }
-  
-    try {
-      // Generate UUID untuk setiap request
-      const requestId = uuidv4();
-  
-      // Panggil OpenAI untuk menganalisis teks dengan format chat (messages)
-      const response = await llm.call([
-        {
-          role: 'user',
-          content: `Please analyze the following text for grammatical errors and corrections, and provide the results in the following JSON format:
-          {
-            "grade" : "a grade between 1 and 5 based on grammatical accuracy, with 1 being the lowest and 5 being the highest, format output 1/5",
-            "mistakes": [
-              {
-                "mistake": "word with mistake",
-                "location": "context where mistake occurs",
-                "correction": "correct word",
-                "error_type": "type of error (e.g., Subject-Verb Agreement, Verb Tense)",
-                "rule": "a fun or easy-to-understand explanation of the rule"
-              }
-            ]
-          }
-          Text: ${text}`
-        }
-      ]);
-  
-      // Parse hasil dari OpenAI menjadi format JSON
-      const aiResponse = JSON.parse(response.content); // 'response.content' adalah string hasil dari OpenAI
-  
-      // Simpan hasil ke dalam objek results berdasarkan requestId
-      results[requestId] = aiResponse || dummyDataStructure;
-  
-      // Kembalikan requestId ke klien agar bisa mengambil hasil nanti
-      res.json({ requestId });
-    } catch (error) {
-      console.error("Error during text analysis:", error);
-      res.status(500).json({ error: "Error processing the text." });
-    }
-  });
 
-  app.post("/ai_analyze", async (req, res) => {
-    const { texts } = req.body; // Mengharapkan beberapa potongan teks
-  
-    if (!Array.isArray(texts) || texts.length === 0) {
-      return res.status(400).json({ error: "Invalid input. Please provide an array of texts." });
-    }
-  
-    try {
-      // Generate unique requestId
-      const requestId = uuidv4();
-  
-      // Inisialisasi array untuk menyimpan hasil analisis per teks
-      const analysisData = [];
-  
-      // Loop melalui setiap teks yang diberikan oleh user
-      for (const text of texts) {
-        // Panggil OpenAI untuk setiap teks
-        const response = await llm.call([
-          {
-            role: "user",
-            content: `
-              Please analyze the following text and provide results in this JSON format:
-              {
-                "part": "${text}",
-                "positive": "provide an analysis of the text",
-                "improvement_suggestions": "suggestions for improvement"
-              }
-              Text: ${text}
-            `
-          }
-        ]);
-        
-  
-        // Parse hasil dari OpenAI menjadi format JSON
-        const aiResponse = JSON.parse(response.content);
-  
-        // Tambahkan hasil analisis ke dalam array analysisData
-        analysisData.push(aiResponse);
-      }
-  
-      // Setelah semua bagian dianalisis, mintalah analisis keseluruhan
-      const overallResponse = await llm.call([
-        {
-          role: "user",
-          content: `
-            Please provide an overall analysis of the following texts:
-            ${texts.join(' ')}
-            Provide the overall analysis in this format:
-            {
-              "overall_analysis": "provide an overall analysis of the entire text",
-              "improve_analysis":  "Improve analysis of all the texts"
-            }
-          `
-        }
-      ]);
-  
-      // Parse hasil dari OpenAI menjadi format JSON untuk overall analysis
-      const overallAnalysis = JSON.parse(overallResponse.content);
-  
-      // Struktur akhir dari respons
-      const finalResponse = {
-        "ai_analysis": {
-          "data": analysisData,
-          "overall_analysis": overallAnalysis.overall_analysis || "Overall analysis of all the texts.",
-          "improve_analysis": overallAnalysis.improve_analysis  ||  "Improve analysis of all the texts"
-        }
-      };
-  
-      // Simpan hasil ke dalam objek results berdasarkan requestId
-      results[requestId] = finalResponse;
-  
-      // Kembalikan requestId ke klien agar mereka bisa mengambil hasil nanti
-      res.json({ requestId });
-    } catch (error) {
-      console.error("Error during text analysis:", error);
-      res.status(500).json({ error: "Error processing the text." });
-    }
-  });
-  
-  
-  app.get('/result/ai_analyze/:requestId', (req, res) => {
-    const { requestId } = req.params;
-  
-    // Cek apakah hasil dengan requestId yang diminta tersedia
-    if (results[requestId]) {
-      res.json(results[requestId]);
-    } else {
-      res.status(404).json({ error: "Result not found." });
-    }
-  });
 
-// Menangani preflight (OPTIONS) request
-app.options('*', cors());
-
-// Mengekspos aplikasi Express sebagai Firebase Cloud Function
-exports.app = functions.https.onRequest(app);
+// Export the app as a Firebase Cloud Function
+exports.dummy = functions.https.onRequest(app);
